@@ -46,7 +46,7 @@ impl ShadowWal {
 
     pub fn into_log(self) -> Result<Log> {
         Ok(Arc::into_inner(self.log)
-            .ok_or_else(|| anyhow!("log is still used by a wal"))?
+            .ok_or_else(|| anyhow!("log is still used by a shadow wal"))?
             .into_inner())
     }
 }
@@ -134,5 +134,67 @@ impl ShadowWal {
         let mut log = self.log.lock();
         log.rollback();
         self.buffer.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use libsql_sys::{connection::NO_AUTOCHECKPOINT, Connection};
+    use rusqlite::OpenFlags;
+    use tempfile::NamedTempFile;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn test_shadow_wal() -> Result<()> {
+        let (shadow_wal, wal_manager) = ShadowWal::new(12).await?;
+        let tmp = NamedTempFile::new()?;
+        let conn = Connection::open(
+            &tmp,
+            OpenFlags::SQLITE_OPEN_READ_WRITE,
+            wal_manager,
+            NO_AUTOCHECKPOINT,
+            None,
+        )?;
+
+        assert!(shadow_wal.log().is_empty());
+        conn.execute_batch("create table test (id integer primary key, name text);")?;
+        assert!(!shadow_wal.log().is_empty());
+        assert!(!shadow_wal.log().has_uncommitted_frames());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_shadow_wal_transaction() -> Result<()> {
+        let (shadow_wal, wal_manager) = ShadowWal::new(12).await?;
+        let tmp = NamedTempFile::new()?;
+        let mut conn = Connection::open(
+            &tmp,
+            OpenFlags::SQLITE_OPEN_READ_WRITE,
+            wal_manager,
+            NO_AUTOCHECKPOINT,
+            None,
+        )?;
+
+        assert!(shadow_wal.log().is_empty());
+        let txn = conn.transaction()?;
+        txn.execute_batch("create table test (id integer primary key, name text)")?;
+        txn.execute("insert into test values (1, 'lol')", ())?;
+        assert!(shadow_wal.log().is_empty());
+        txn.commit()?;
+
+        assert!(!shadow_wal.log().is_empty());
+        assert!(!shadow_wal.log().has_uncommitted_frames());
+        assert_eq!(shadow_wal.log().last_commited_frame_no(), Some(13)); // 12 + 1
+
+        let txn = conn.transaction()?;
+        txn.execute("insert into test values (2, 'kiki')", ())?;
+        assert_eq!(shadow_wal.log().last_commited_frame_no(), Some(13));
+        txn.rollback()?;
+
+        assert_eq!(shadow_wal.log().last_commited_frame_no(), Some(13));
+
+        Ok(())
     }
 }
