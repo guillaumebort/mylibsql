@@ -10,7 +10,7 @@ use uuid::Uuid;
 async fn micro_replication_test() -> Result<()> {
     let (blank_db, log) = init(|conn| Ok(conn.execute_batch("create table stuff(uuid)")?)).await?;
 
-    let mut primary = Primary::open(blank_db.reopen().await?, vec![]).await?;
+    let mut primary = Primary::open(&blank_db, &[]).await?;
     let mut frames = primary.capture_frames();
     let logs_store = Arc::new(Mutex::new(vec![]));
     let replicated_log = Arc::new(Mutex::new(Log::create(log.next_frame_no()).await?));
@@ -38,7 +38,7 @@ async fn micro_replication_test() -> Result<()> {
         while let Ok(next_frames) = frames.try_next().await {
             replicated_log.lock().push_frames(next_frames).await?;
         }
-        let last_replicated_frame = replicated_log.lock().last_commited_frame_no().unwrap();
+        let last_replicated_frame = replicated_log.lock().last_frame_no().unwrap();
         frames.ack_replicated(last_replicated_frame);
     }
 
@@ -81,7 +81,7 @@ async fn micro_replication_test() -> Result<()> {
         while let Ok(next_frames) = frames.try_next().await {
             replicated_log.lock().push_frames(next_frames).await?;
         }
-        let last_replicated_frame = replicated_log.lock().last_commited_frame_no().unwrap();
+        let last_replicated_frame = replicated_log.lock().last_frame_no().unwrap();
         dbg!(last_replicated_frame);
         frames.ack_replicated(last_replicated_frame);
     }
@@ -95,7 +95,7 @@ async fn micro_replication_test() -> Result<()> {
         while let Ok(next_frames) = frames.try_next().await {
             replicated_log.lock().push_frames(next_frames).await?;
         }
-        let last_replicated_frame = replicated_log.lock().last_commited_frame_no().unwrap();
+        let last_replicated_frame = replicated_log.lock().last_frame_no().unwrap();
         dbg!(last_replicated_frame);
         frames.ack_replicated(last_replicated_frame);
     }
@@ -121,7 +121,7 @@ async fn micro_replication_test() -> Result<()> {
             while let Ok(next_frames) = frames.try_next().await {
                 replicated_log.lock().push_frames(next_frames).await?;
             }
-            let last_replicated_frame = replicated_log.lock().last_commited_frame_no().unwrap();
+            let last_replicated_frame = replicated_log.lock().last_frame_no().unwrap();
             dbg!(last_replicated_frame);
             frames.ack_replicated(last_replicated_frame);
         }
@@ -154,7 +154,7 @@ async fn micro_replication_test() -> Result<()> {
     let mut logs = logs_store.lock().clone();
     logs.push(replicated_log.lock().clone());
 
-    let primary = Primary::open(blank_db.reopen().await?, logs).await?;
+    let primary = Primary::open(&blank_db, &logs).await?;
 
     // yes 3 inserts have been lost
     assert_eq!(27, primary.with_connection(count_rows).await?.await);

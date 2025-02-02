@@ -46,8 +46,8 @@ async fn replication_forever() -> Result<()> {
 async fn replication(test_duration: Duration, max_replication_latency: Duration) -> Result<()> {
     let (blank_db, _) = init(|conn| Ok(conn.execute_batch("create table stuff(uuid)")?)).await?;
 
-    let primary = Primary::open(blank_db.reopen().await?, vec![]).await?;
-    let mut replica = Replica::open(blank_db.reopen().await?, vec![]).await?;
+    let primary = Primary::open(&blank_db, &[]).await?;
+    let mut replica = Replica::open(&blank_db, &[]).await?;
 
     let logs_store = Arc::new(Mutex::new(VecDeque::new()));
     let acks = Arc::new(Mutex::new(Vec::new()));
@@ -152,7 +152,7 @@ async fn replication(test_duration: Duration, max_replication_latency: Duration)
                     let log = logs_store.lock().pop_front();
                     match log {
                         Some(Some((epoch, log, inserted))) => {
-                            replica.replicate(log).await?;
+                            replica.replicate(&log).await?;
                             let count = count_rows(&replica).await?;
                             println!("replica sees {} batches at epoch {epoch}", count);
                             if count != inserted {

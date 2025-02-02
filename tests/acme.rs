@@ -5,8 +5,8 @@ use mylibsql::{self, Ack, Log, Primary, Snapshot};
 #[tokio::test]
 async fn basic_usage_with_acme_data() -> Result<()> {
     let primary = Primary::open(
-        Snapshot::open("tests/data/acme/0.db", Some(2)).await?,
-        vec![
+        &Snapshot::open("tests/data/acme/0.db").await?,
+        &[
             Log::open("tests/data/acme/1.log").await?,
             Log::open("tests/data/acme/2.log").await?,
             Log::open("tests/data/acme/3.log").await?,
@@ -124,47 +124,6 @@ async fn basic_usage_with_acme_data() -> Result<()> {
         names,
         vec![("Mark".to_string(), 70000.0), ("Bob".to_string(), 95700.0)]
     );
-
-    Ok(())
-}
-
-#[tokio::test]
-#[ignore]
-async fn generate_acme_test_data() -> Result<()> {
-    let (snapshot, log) = mylibsql::init(|conn| {
-        let sql = std::fs::read_to_string("tests/data/acme/0.sql")?;
-        conn.execute_batch(&sql)?;
-        Ok(())
-    })
-    .await?;
-
-    dbg!(snapshot.last_frame_no);
-    snapshot.move_to("tests/data/acme/0.db").await?;
-    log.copy_to("tests/data/acme/0.log").await?;
-
-    let primary = mylibsql::Primary::open(
-        Snapshot::open("tests/data/acme/0.db", Some(2)).await?,
-        vec![],
-    )
-    .await?;
-
-    for epoch in 1..=3 {
-        let sql = std::fs::read_to_string(format!("tests/data/acme/{epoch}.sql"))?;
-        let _ = primary
-            .with_connection(move |conn| Ok(conn.execute_batch(&sql)?))
-            .await?;
-        primary
-            .checkpoint(move |log| {
-                async move {
-                    log.copy_to(format!("tests/data/acme/{epoch}.log"))
-                        .await
-                        .unwrap();
-                }
-                .boxed()
-            })
-            .await?
-            .await;
-    }
 
     Ok(())
 }

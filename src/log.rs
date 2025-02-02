@@ -18,6 +18,7 @@ use zerocopy::{
 // /!\ this is basically a simplified fork of the original libsql-server `ReplicationLogger`
 // see: libsql/libsql-server/src/replication/primary/logger.rs
 
+/// A log file used to store SQLite WAL frames
 #[derive(Debug, Clone)]
 pub struct Log(Arc<RwLock<LogFile>>);
 
@@ -26,43 +27,52 @@ impl Log {
         Self(Arc::new(RwLock::new(log_file)))
     }
 
-    pub async fn open(path: impl AsRef<Path> + Send + 'static) -> Result<Self> {
+    /// Open an existing log file
+    pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref().to_owned();
         tokio::task::spawn_blocking(move || Ok(Log::new(LogFile::open(path)?))).await?
     }
 
+    /// Create a new log file starting at the given frame number
     pub async fn create(start_frame_no: FrameNo) -> Result<Self> {
         tokio::task::spawn_blocking(move || Ok(Log::new(LogFile::new(start_frame_no)?))).await?
     }
 
+    /// Return the frame number of the first frame in the log
     pub fn start_frame_no(&self) -> FrameNo {
         self.0.read().header.start_frame_no.get()
     }
 
+    /// Return the frame number of the next frame to be written
     pub fn next_frame_no(&self) -> FrameNo {
         self.0.read().next_frame_no()
     }
 
+    /// Return the frame number of the last frame in the log
     pub fn last_frame_no(&self) -> Option<FrameNo> {
         self.0.read().last_frame_no()
     }
 
+    /// Check if the log is empty
     pub fn is_empty(&self) -> bool {
         self.0.read().is_empty()
     }
 
-    pub fn has_uncommitted_frames(&self) -> bool {
+    pub(crate) fn has_uncommitted_frames(&self) -> bool {
         self.0.read().has_uncommitted_frames()
     }
 
-    pub fn last_commited_frame_no(&self) -> Option<FrameNo> {
+    pub(crate) fn last_commited_frame_no(&self) -> Option<FrameNo> {
         self.0.read().last_commited_frame_no()
     }
 
+    /// Read a frame from the log
     pub async fn read_frame(&self, frame_no: FrameNo) -> Result<Frame> {
         let log = self.0.clone();
         tokio::task::spawn_blocking(move || log.read().read_frame(frame_no)).await?
     }
 
+    /// Push new frames to the log
     pub async fn push_frames(&mut self, frames: Vec<Frame>) -> Result<()> {
         let log = self.0.clone();
         tokio::task::spawn_blocking(move || {
@@ -76,6 +86,7 @@ impl Log {
         .await?
     }
 
+    /// Copy the log file to the given path
     pub async fn copy_to(&self, path: impl AsRef<Path>) -> Result<()> {
         let log = self.0.clone();
         let path = path.as_ref().to_owned();
@@ -88,6 +99,8 @@ impl Log {
         .await?
     }
 
+    /// Truncate the log file to the given frame number:
+    /// Frames before the given frame number will be removed.
     pub async fn truncate(&self, start_frame_no: FrameNo) -> Result<()> {
         let log = self.0.clone();
         tokio::task::spawn_blocking(move || {

@@ -5,6 +5,7 @@ use futures::FutureExt;
 use libsql::replication::FrameNo;
 use tokio::sync::oneshot;
 
+/// A future that resolves when an operation is safely checkpointed
 #[must_use = "Acks must be awaited, or explicitly dropped if you don't care about the result"]
 pub struct Ack<A>
 where
@@ -21,6 +22,18 @@ where
     /// Lookup the result before it's acked
     pub fn peek(&self) -> &A {
         self.result.as_ref().expect("ack was already consumed")
+    }
+
+    /// Split the ack into the actual result and the ack future
+    /// Useful when you want to use the result immediately and wait for the ack later
+    pub fn split(self) -> (A, Ack<()>) {
+        (
+            self.result.unwrap(),
+            Ack {
+                result: Some(()),
+                ack: self.ack,
+            },
+        )
     }
 
     pub(super) fn new_ready(result: A) -> Self {
