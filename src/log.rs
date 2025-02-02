@@ -1,5 +1,5 @@
 use super::{wal::WalPage, Version};
-use std::{fs::File, io::Write, os::unix::fs::FileExt};
+use std::{fs::File, io::Write, os::unix::fs::FileExt, path::Path};
 
 use anyhow::{anyhow, bail, Result};
 use crc::Crc;
@@ -13,6 +13,9 @@ use zerocopy::{
     byteorder::little_endian::{I32 as li32, U16 as lu16, U32 as lu32, U64 as lu64},
     AsBytes, FromBytes,
 };
+
+// /!\ this is basically a simplified fork of the original libsql-server `ReplicationLogger`
+// see: libsql/libsql-server/src/replication/primary/logger.rs
 
 pub const MAGIC: u64 = u64::from_le_bytes(*b"MYLIBSQL");
 const CRC_64_GO_ISO: Crc<u64> = Crc::<u64>::new(&crc::CRC_64_GO_ISO);
@@ -68,38 +71,60 @@ impl Log {
     /// size of a single frame
     pub const FRAME_SIZE: usize = size_of::<FrameHeader>() + LIBSQL_PAGE_SIZE as usize;
 
-    pub fn open(file: File) -> Result<Self> {
-        todo!()
+    pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref().to_owned();
+        tokio::task::spawn_blocking(|| {
+            let file = File::open(path)?;
+            let header = Self::read_header(&file)?;
+            Ok(Self {
+                file,
+                header,
+                uncommitted_frame_count: 0,
+                uncommitted_checksum: header.start_checksum.get(),
+                commited_checksum: header.start_checksum.get(),
+            })
+        })
+        .await?
     }
 
-    pub fn new(start_frame_no: u64) -> Result<Self> {
-        let file = tempfile()?;
+    pub async fn new(start_frame_no: u64) -> Result<Self> {
+        tokio::task::spawn_blocking(move || {
+            let file = tempfile()?;
 
-        let header = LogHeader {
-            version: 2.into(),
-            start_frame_no: start_frame_no.into(),
-            magic: MAGIC.into(),
-            page_size: (LIBSQL_PAGE_SIZE as i32).into(),
-            start_checksum: 0.into(),
-            frame_count: 0.into(),
-            mylibsql_version: Version::current().0.map(Into::into),
-        };
+            let header = LogHeader {
+                version: 2.into(),
+                start_frame_no: start_frame_no.into(),
+                magic: MAGIC.into(),
+                page_size: (LIBSQL_PAGE_SIZE as i32).into(),
+                start_checksum: 0.into(),
+                frame_count: 0.into(),
+                mylibsql_version: Version::current().0.map(Into::into),
+            };
 
-        let mut this = Self {
-            file,
-            header,
-            uncommitted_frame_count: 0,
-            uncommitted_checksum: 0,
-            commited_checksum: 0,
-        };
+            let mut this = Self {
+                file,
+                header,
+                uncommitted_frame_count: 0,
+                uncommitted_checksum: 0,
+                commited_checksum: 0,
+            };
 
-        this.write_header()?;
+            this.write_header()?;
 
-        Ok(this)
+            Ok(this)
+        })
+        .await?
     }
 
     pub fn into_file(self) -> File {
         self.file
+    }
+
+    pub async fn move_to(self, path: impl AsRef<Path>) -> Result<()> {
+        let mut file = tokio::fs::File::from_std(self.file);
+        let mut new_file = tokio::fs::File::create(path).await?;
+        tokio::io::copy(&mut file, &mut new_file).await?;
+        Ok(())
     }
 
     fn read_header(file: &File) -> Result<LogHeader> {
@@ -118,7 +143,7 @@ impl Log {
         &self.header
     }
 
-    pub fn commit(&mut self) -> Result<()> {
+    pub(crate) fn commit(&mut self) -> Result<()> {
         self.header.frame_count += self.uncommitted_frame_count.into();
         self.uncommitted_frame_count = 0;
         self.commited_checksum = self.uncommitted_checksum;
@@ -127,7 +152,7 @@ impl Log {
         Ok(())
     }
 
-    pub fn rollback(&mut self) {
+    pub(crate) fn rollback(&mut self) {
         self.uncommitted_frame_count = 0;
         self.uncommitted_checksum = self.commited_checksum;
     }
@@ -139,11 +164,7 @@ impl Log {
         Ok(())
     }
 
-    pub fn start_frame_no(&self) -> FrameNo {
-        self.header.start_frame_no.get()
-    }
-
-    pub fn last_commited_frame_no(&self) -> Option<FrameNo> {
+    pub(crate) fn last_commited_frame_no(&self) -> Option<FrameNo> {
         if self.header.frame_count.get() == 0 {
             None
         } else {
@@ -155,30 +176,13 @@ impl Log {
         self.header.frame_count.get() + self.uncommitted_frame_count == 0
     }
 
+    pub fn has_uncommitted_frames(&self) -> bool {
+        self.uncommitted_frame_count > 0
+    }
+
     /// Returns the bytes position of the `nth` entry in the log
     fn absolute_byte_offset(nth: u64) -> u64 {
         std::mem::size_of::<LogHeader>() as u64 + nth * Self::FRAME_SIZE as u64
-    }
-
-    fn byte_offset(&self, id: FrameNo) -> Result<Option<u64>> {
-        if id < self.header.start_frame_no.get()
-            || id > self.header.start_frame_no.get() + self.header.frame_count.get()
-        {
-            return Ok(None);
-        }
-        Ok(Self::absolute_byte_offset(id - self.header.start_frame_no.get()).into())
-    }
-
-    fn frame(&self, frame_no: FrameNo) -> Result<Frame> {
-        if frame_no < self.header.start_frame_no.get()
-            || frame_no >= self.header.start_frame_no.get() + self.header.frame_count.get()
-        {
-            bail!("frame {frame_no} not in log");
-        } else {
-            let frame = self.read_frame_byte_offset_mut(self.byte_offset(frame_no)?.unwrap())?;
-
-            Ok(frame.into())
-        }
     }
 
     fn read_frame_byte_offset_mut(&self, offset: u64) -> Result<FrameMut> {
@@ -198,13 +202,13 @@ impl Log {
         Self::absolute_byte_offset(self.header().frame_count.get() + self.uncommitted_frame_count)
     }
 
-    pub fn next_frame_no(&self) -> FrameNo {
+    pub(crate) fn next_frame_no(&self) -> FrameNo {
         self.header().start_frame_no.get()
             + self.header().frame_count.get()
             + self.uncommitted_frame_count
     }
 
-    pub fn push_page(&mut self, page: &WalPage) -> Result<()> {
+    pub(crate) fn push_page(&mut self, page: &WalPage) -> Result<()> {
         let checksum = self.compute_checksum(page);
         let data = &page.data;
         let frame = Frame::from_parts(
@@ -230,7 +234,7 @@ impl Log {
         Ok(())
     }
 
-    pub fn frames_iter(&self) -> Result<impl Iterator<Item = Result<Frame>> + '_> {
+    pub(crate) fn frames_iter(&self) -> Result<impl Iterator<Item = Result<Frame>> + '_> {
         let mut current_frame_offset = 0;
         Ok(std::iter::from_fn(move || {
             if current_frame_offset >= self.header.frame_count.get() {
@@ -243,5 +247,118 @@ impl Log {
                     .map(|f| f.into()),
             )
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+    use tempfile::NamedTempFile;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn test_log_open() -> Result<()> {
+        let file = NamedTempFile::new()?;
+        let header = LogHeader {
+            version: 2.into(),
+            start_frame_no: 0.into(),
+            magic: MAGIC.into(),
+            page_size: (LIBSQL_PAGE_SIZE as i32).into(),
+            start_checksum: 0.into(),
+            frame_count: 0.into(),
+            mylibsql_version: Version::current().0.map(Into::into),
+        };
+
+        let mut log = Log {
+            file: file.reopen()?,
+            header,
+            uncommitted_frame_count: 0,
+            uncommitted_checksum: 0,
+            commited_checksum: 0,
+        };
+
+        log.write_header()?;
+
+        let log = Log::open(file.path()).await?;
+        assert_eq!(log.header.magic.get(), MAGIC);
+        assert_eq!(log.header.version.get(), 2);
+        assert_eq!(log.header.page_size.get(), LIBSQL_PAGE_SIZE as i32);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_log_new() -> Result<()> {
+        let log = Log::new(0).await?;
+        assert_eq!(log.header.magic.get(), MAGIC);
+        assert_eq!(log.header.version.get(), 2);
+        assert_eq!(log.header.page_size.get(), LIBSQL_PAGE_SIZE as i32);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_log_commit_and_rollback() -> Result<()> {
+        let mut log = Log::new(0).await?;
+        let page = WalPage {
+            page_no: 1,
+            data: Bytes::from(vec![0; LIBSQL_PAGE_SIZE as usize]),
+            size_after: 0,
+        };
+
+        log.push_page(&page)?;
+        assert!(log.has_uncommitted_frames());
+
+        log.commit()?;
+        assert!(!log.has_uncommitted_frames());
+
+        log.push_page(&page)?;
+        assert!(log.has_uncommitted_frames());
+
+        log.rollback();
+        assert!(!log.has_uncommitted_frames());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_log_move_to() -> Result<()> {
+        let log = Log::new(0).await?;
+        let new_path = NamedTempFile::new()?;
+        log.move_to(&new_path).await?;
+        assert!(new_path.path().exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_log_is_empty() -> Result<()> {
+        let mut log = Log::new(0).await?;
+        assert!(log.is_empty());
+
+        let page = WalPage {
+            page_no: 1,
+            data: Bytes::from(vec![0; LIBSQL_PAGE_SIZE as usize]),
+            size_after: 0,
+        };
+
+        log.push_page(&page)?;
+        assert!(!log.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_log_frames_iter() -> Result<()> {
+        let mut log = Log::new(0).await?;
+        let page = WalPage {
+            page_no: 1,
+            data: Bytes::from(vec![0; LIBSQL_PAGE_SIZE as usize]),
+            size_after: 0,
+        };
+
+        log.push_page(&page)?;
+        log.commit()?;
+
+        let frames: Vec<_> = log.frames_iter()?.collect::<Result<_>>()?;
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].header().page_no.get(), 1);
+        Ok(())
     }
 }

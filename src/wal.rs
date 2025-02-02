@@ -1,15 +1,15 @@
 use super::log::Log;
 
-use std::{fs::File, sync::Arc};
+use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
-use libsql::{ffi::SQLITE_IOERR, replication::FrameNo};
+use libsql::ffi::SQLITE_IOERR;
 use libsql_sys::{
     rusqlite,
     wal::{
-        wrapper::{WalWrapper, WrapWal, WrappedWal},
-        Sqlite3Wal, Sqlite3WalManager, Wal, WalManager,
+        wrapper::{WalWrapper, WrapWal},
+        Sqlite3WalManager, Wal,
     },
 };
 use parking_lot::{Mutex, MutexGuard};
@@ -23,17 +23,19 @@ pub struct WalPage {
 }
 
 #[derive(Clone)]
-pub struct MylibsqlWal {
+pub struct ShadowWal {
     buffer: Vec<WalPage>,
     log: Arc<Mutex<Log>>,
 }
 
-impl MylibsqlWal {
-    pub fn new(start_frame_no: u64) -> Result<(Self, WalWrapper<MylibsqlWal, Sqlite3WalManager>)> {
-        let log = Log::new(start_frame_no)?;
+impl ShadowWal {
+    pub async fn new(
+        start_frame_no: u64,
+    ) -> Result<(Self, WalWrapper<ShadowWal, Sqlite3WalManager>)> {
+        let log = Log::new(start_frame_no).await?;
         let log = Arc::new(Mutex::new(log));
         let buffer = Vec::new();
-        let wal = MylibsqlWal { buffer, log };
+        let wal = ShadowWal { buffer, log };
         let wal_wrapper = WalWrapper::new(wal.clone(), Sqlite3WalManager::new());
         Ok((wal, wal_wrapper))
     }
@@ -49,7 +51,7 @@ impl MylibsqlWal {
     }
 }
 
-impl<W: Wal> WrapWal<W> for MylibsqlWal {
+impl<W: Wal> WrapWal<W> for ShadowWal {
     fn undo<U: libsql_sys::wal::UndoHandler>(
         &mut self,
         wrapped: &mut W,
@@ -97,7 +99,7 @@ impl<W: Wal> WrapWal<W> for MylibsqlWal {
     }
 }
 
-impl MylibsqlWal {
+impl ShadowWal {
     fn write_frame(&mut self, page_no: u32, data: &[u8]) {
         let entry = WalPage {
             page_no,
