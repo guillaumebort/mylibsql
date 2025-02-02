@@ -1,20 +1,21 @@
 use super::*;
-use std::{fmt::Debug, path::PathBuf, sync::Arc};
+use std::{fmt::Debug, future::Future, path::PathBuf, sync::Arc};
 
 use anyhow::{anyhow, bail, Result};
 use futures::future::BoxFuture;
 use libsql::replication::{Frame, FrameNo};
 use libsql_replication::injector::{Injector, SqliteInjector};
 use libsql_sys::{
-    connection::NO_AUTOCHECKPOINT,
-    rusqlite::OpenFlags,
-    wal::{wrapper::WrappedWal, Sqlite3Wal, Sqlite3WalManager},
-    Connection,
+    connection::NO_AUTOCHECKPOINT, rusqlite::OpenFlags, wal::{wrapper::WrappedWal, Sqlite3Wal, Sqlite3WalManager}, Connection
 };
 use log::Log;
 use parking_lot::Mutex;
 use snapshot::Snapshot;
 use tempfile::NamedTempFile;
+use tokio::{
+    sync::{mpsc, oneshot},
+    task::JoinSet,
+};
 use wal::ShadowWal;
 
 pub struct MylibsqlDB {
@@ -23,6 +24,9 @@ pub struct MylibsqlDB {
     injector: SqliteInjector,
     rw_conn: Arc<Mutex<Connection<WrappedWal<ShadowWal, Sqlite3Wal>>>>,
     ro_conn: Arc<Mutex<Connection<Sqlite3Wal>>>,
+    checkpoint_tx: mpsc::UnboundedSender<(BoxFuture<'static, ()>, oneshot::Sender<()>)>,
+    #[allow(unused)]
+    tasks: JoinSet<()>,
 }
 
 impl Debug for MylibsqlDB {
@@ -48,7 +52,15 @@ impl MylibsqlDB {
                 None,
             )?;
             init(&conn)?;
-            Self::wal_checkpoint(&conn)?;
+            // truncate WAL
+            conn.query_row_and_then("PRAGMA wal_checkpoint(TRUNCATE)", (), |row| {
+                let status: i32 = row.get(0)?;
+                if status != 0 {
+                    Err(anyhow!("WAL checkpoint failed with status {}", status))
+                } else {
+                    Ok(())
+                }
+            })?;
             drop(conn);
             let log = wal.into_log()?;
             Ok((
@@ -72,6 +84,7 @@ impl MylibsqlDB {
                 .unwrap_or_default(),
         )
         .await?;
+        let mut tasks = JoinSet::new();
         let db = tokio::task::spawn_blocking(move || {
             let rw_conn = Connection::open(
                 &path,
@@ -87,16 +100,29 @@ impl MylibsqlDB {
                 NO_AUTOCHECKPOINT,
                 None,
             )?;
+            let (checkpoint_tx, checkpoint_rx) = mpsc::unbounded_channel();
+            tasks.spawn(Self::save_checkpoints(checkpoint_rx));
             anyhow::Ok(MylibsqlDB {
                 path,
                 rw_conn: Arc::new(Mutex::new(rw_conn)),
                 ro_conn: Arc::new(Mutex::new(ro_conn)),
                 shadow_wal,
                 injector,
+                checkpoint_tx,
+                tasks,
             })
         })
         .await??;
         Ok(db)
+    }
+
+    async fn save_checkpoints(
+        mut checkpoint_rx: mpsc::UnboundedReceiver<(BoxFuture<'static, ()>, oneshot::Sender<()>)>,
+    ) {
+        while let Some((checkpoint, ack)) = checkpoint_rx.recv().await {
+            checkpoint.await;
+            let _ = ack.send(());
+        }
     }
 
     pub async fn inject_log(&mut self, additional_log: Log) -> Result<()> {
@@ -116,8 +142,22 @@ impl MylibsqlDB {
         }
         *self.shadow_wal.log() =
             tokio::task::spawn_blocking(move || Log::new(additional_log.next_frame_no())).await??;
+        let rw_conn = self.rw_conn.clone();
+        tokio::task::spawn_blocking(move || {
+            // truncate WAL
+            rw_conn
+                .lock()
+                .query_row_and_then("PRAGMA wal_checkpoint(TRUNCATE)", (), |row| {
+                    let status: i32 = row.get(0)?;
+                    if status != 0 {
+                        Err(anyhow!("WAL checkpoint failed with status {}", status))
+                    } else {
+                        Ok(())
+                    }
+                })
+        })
+        .await??;
         self.injector.flush().await?;
-        Self::wal_checkpoint(&*self.rw_conn.lock())?;
         Ok(())
     }
 
@@ -128,23 +168,6 @@ impl MylibsqlDB {
                 ..Default::default()
             })
             .await?;
-        Ok(())
-    }
-
-    fn wal_checkpoint(conn: &rusqlite::Connection) -> Result<()> {
-        // TODO: TRUNCATE here is likely going to fail in some cases, we need to revisit this
-        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", (), |row| {
-            let status: i32 = row.get(0)?;
-            let wal_frames: i32 = row.get(1)?;
-            let moved_frames: i32 = row.get(2)?;
-            tracing::trace!(
-                "WAL checkpoint successful, status: {}, WAL frames: {}, moved frames: {}",
-                status,
-                wal_frames,
-                moved_frames
-            );
-            Ok(())
-        })?;
         Ok(())
     }
 
@@ -170,15 +193,37 @@ impl MylibsqlDB {
         Ok(tokio::task::spawn_blocking(move || f(&mut *conn.lock())).await??)
     }
 
-    pub async fn checkpoint<'a>(
-        &'a self,
-        f: impl FnOnce(Log) -> BoxFuture<'a, ()>,
-    ) -> Result<Option<FrameNo>> {
-        let old_log = self.shadow_wal.swap_log()?; // TODO: swap_log is blocking
-        Self::wal_checkpoint(&*self.rw_conn.lock())?; // TODO: this is blocking as well
+    pub async fn checkpoint(
+        &self,
+        f: impl FnOnce(Log) -> BoxFuture<'static, ()>,
+    ) -> Result<impl Future<Output = Result<Option<FrameNo>>>> {
+        let shadow_wal = self.shadow_wal.clone();
+        let rw_conn = self.rw_conn.clone();
+        let old_log = tokio::task::spawn_blocking(move || {
+            let old_log = shadow_wal.swap_log()?;
+            // checkpoint WAL as much as possible
+            rw_conn
+                .lock()
+                .query_row_and_then("PRAGMA wal_checkpoint(PASSIVE)", (), |row| {
+                    let status: i32 = row.get(0)?;
+                    if status != 0 {
+                        Err(anyhow!("WAL checkpoint failed with status {}", status))
+                    } else {
+                        Ok(())
+                    }
+                })?;
+            anyhow::Ok(old_log)
+        })
+        .await??;
         let last_frame_no = old_log.last_commited_frame_no();
-        f(old_log).await;
-        Ok(last_frame_no)
+        let (tx, rx) = oneshot::channel();
+        self.checkpoint_tx
+            .send((f(old_log), tx))
+            .map_err(|_| anyhow!("cannot process checkpoint"))?;
+        Ok(async move {
+            rx.await?;
+            Ok(last_frame_no)
+        })
     }
 
     pub fn current_frame_no(&self) -> Result<Option<FrameNo>> {
@@ -304,27 +349,27 @@ mod tests {
         };
 
         let db = MylibsqlDB::open(blank_db()?).await?;
-        assert_eq!(None, db.checkpoint(&save_log).await?);
+        assert_eq!(None, db.checkpoint(&save_log).await?.await?);
 
         // first checkpoint (create table)
         db.with_rw_connection(|conn| Ok(conn.execute("create table boo(x string)", ())?))
             .await?;
-        assert_eq!(Some(1), db.checkpoint(&save_log).await?);
+        assert_eq!(Some(1), db.checkpoint(&save_log).await?.await?);
 
         // second checkpoint (insert data)
         db.with_rw_connection(|conn| Ok(conn.execute("insert into boo values ('YO')", ())?))
             .await?;
-        assert_eq!(Some(2), db.checkpoint(&save_log).await?);
+        assert_eq!(Some(2), db.checkpoint(&save_log).await?.await?);
 
         // third checkpoint (update data)
         db.with_rw_connection(|conn| Ok(conn.execute("update boo set x = 'YOO'", ())?))
             .await?;
-        assert_eq!(Some(3), db.checkpoint(&save_log).await?);
+        assert_eq!(Some(3), db.checkpoint(&save_log).await?.await?);
 
         // fourth checkpoint (delete data)
         db.with_rw_connection(|conn| Ok(conn.execute("delete from boo", ())?))
             .await?;
-        assert_eq!(Some(4), db.checkpoint(&save_log).await?);
+        assert_eq!(Some(4), db.checkpoint(&save_log).await?.await?);
 
         drop(save_log);
         let mut logs_store = Arc::into_inner(logs_store).unwrap().into_inner();
@@ -411,6 +456,7 @@ mod tests {
             }
             .boxed()
         })
+        .await?
         .await?;
 
         Ok(())

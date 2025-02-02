@@ -65,7 +65,8 @@ async fn basic_usage_with_acme_data() -> Result<()> {
             }
             .boxed()
         })
-        .await?;
+        .await?
+        .await;
 
     // so now previous ack is ready
     assert_eq!(ack.now_or_never(), Some(1));
@@ -78,7 +79,8 @@ async fn basic_usage_with_acme_data() -> Result<()> {
             }
             .boxed()
         })
-        .await?;
+        .await?
+        .await;
 
     // delete a row
     let mut ack = primary
@@ -101,7 +103,8 @@ async fn basic_usage_with_acme_data() -> Result<()> {
             }
             .boxed()
         })
-        .await?;
+        .await?
+        .await;
 
     // so now we can move to replica
     let replica = primary.into_replica().unwrap();
@@ -151,7 +154,7 @@ async fn generate_acme_test_data() -> Result<()> {
             .with_connection(move |conn| Ok(conn.execute_batch(&sql)?))
             .await?;
         primary
-            .checkpoint(|log| {
+            .checkpoint(move |log| {
                 async move {
                     log.move_to(format!("tests/data/acme/{epoch}.log"))
                         .await
@@ -159,7 +162,8 @@ async fn generate_acme_test_data() -> Result<()> {
                 }
                 .boxed()
             })
-            .await?;
+            .await?
+            .await;
     }
 
     Ok(())

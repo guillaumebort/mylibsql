@@ -13,19 +13,37 @@ use uuid::Uuid;
 
 #[tokio::test]
 async fn replication_test() -> Result<()> {
-    replication(Duration::from_secs(1)).await
+    replication(Duration::from_secs(1), Duration::from_millis(100)).await
 }
 
 #[tokio::test]
 #[ignore = "slow test, run manually"]
-async fn replication_test_slow() -> Result<()> {
-    replication(Duration::from_secs(30)).await
+async fn replication_test_slow_1() -> Result<()> {
+    replication(Duration::from_secs(30), Duration::from_millis(100)).await
+}
+
+#[tokio::test]
+#[ignore = "slow test, run manually"]
+async fn replication_test_slow_2() -> Result<()> {
+    replication(Duration::from_secs(30), Duration::ZERO).await
+}
+
+#[tokio::test]
+#[ignore = "slow test, run manually"]
+async fn replication_test_slow_3() -> Result<()> {
+    replication(Duration::from_secs(30), Duration::from_secs(1)).await
+}
+
+#[tokio::test]
+#[ignore = "slow test, run manually"]
+async fn replication_forever() -> Result<()> {
+    replication(Duration::MAX, Duration::ZERO).await
 }
 
 // 1 task inject rows into the primary database (with some random transaction rollbacks) and checkpoints every 100ms
 // 1 task reads the logs and replays them into the replica
 // at the end of the test, the replica should see the same number of rows as the primary
-async fn replication(test_duration: Duration) -> Result<()> {
+async fn replication(test_duration: Duration, max_replication_latency: Duration) -> Result<()> {
     let (blank_db, _) = init(|conn| Ok(conn.execute_batch("create table stuff(uuid)")?)).await?;
 
     let primary = Primary::open(blank_db.reopen().await?, vec![]).await?;
@@ -35,6 +53,8 @@ async fn replication(test_duration: Duration) -> Result<()> {
     let acks = Arc::new(Mutex::new(Vec::new()));
 
     println!("running for {}s... ", test_duration.as_secs());
+    println!("primary: {primary:?}");
+    println!("replica: {replica:?}");
 
     let write_loop = tokio::spawn({
         let logs_store = logs_store.clone();
@@ -43,6 +63,7 @@ async fn replication(test_duration: Duration) -> Result<()> {
             let mut inserted = 0;
             let start = Instant::now();
             let mut t = Instant::now();
+            let mut epoch = 0;
             loop {
                 if let Ok(ack) = primary
                     .with_connection(|conn| {
@@ -71,32 +92,44 @@ async fn replication(test_duration: Duration) -> Result<()> {
 
                 // checkpoint every 100ms
                 if t.elapsed() > Duration::from_millis(100) {
-                    println!("primary inserted {} batches", inserted);
+                    epoch += 1;
+                    let epoch = epoch;
+                    println!("primary inserted {inserted} batches at epoch {epoch}");
                     let logs_store = logs_store.clone();
-                    // TODO: checkpoint must be spawned (or internally spawn) to avoid blocking the write loop
-                    primary
-                        .checkpoint(|log| {
-                            async move {
-                                logs_store.lock().push_back(Some(log));
-                            }
-                            .boxed()
-                        })
-                        .await?;
+                    // checkpoint and fork to store the log
+                    tokio::spawn(
+                        primary
+                            .checkpoint(move |log| {
+                                // random delay
+                                let push_latency =
+                                    Duration::from_millis(rand::thread_rng().gen_range(
+                                        0..=max_replication_latency.as_millis().try_into().unwrap(),
+                                    ));
+                                async move {
+                                    tokio::time::sleep(push_latency).await;
+                                    logs_store.lock().push_back(Some((epoch, log, inserted)));
+                                }
+                                .boxed()
+                            })
+                            .await?,
+                    );
                     t = Instant::now();
                 }
 
                 // stop after test_duration
                 if start.elapsed() > test_duration {
                     primary
-                        .checkpoint(|log| {
+                        .checkpoint(move |log| {
+                            epoch += 1;
                             async move {
-                                logs_store.lock().push_back(Some(log));
+                                println!("primary inserted {inserted} batches at epoch {epoch}");
+                                logs_store.lock().push_back(Some((epoch, log, inserted)));
                                 logs_store.lock().push_back(None);
-                                println!("primary inserted {} batches", inserted);
                             }
                             .boxed()
                         })
-                        .await?;
+                        .await?
+                        .await;
                     return anyhow::Ok(inserted);
                 }
             }
@@ -118,9 +151,16 @@ async fn replication(test_duration: Duration) -> Result<()> {
                 loop {
                     let log = logs_store.lock().pop_front();
                     match log {
-                        Some(Some(log)) => {
+                        Some(Some((epoch, log, inserted))) => {
                             replica.replicate(log).await?;
-                            println!("replica sees {} batches", count_rows(&replica).await?);
+                            let count = count_rows(&replica).await?;
+                            println!("replica sees {} batches at epoch {epoch}", count);
+                            if count != inserted {
+                                panic!(
+                                    "!!!! replica sees {} batches, expected {}",
+                                    count, inserted
+                                );
+                            }
                         }
                         Some(None) => {
                             return anyhow::Ok(count_rows(&replica).await?);
@@ -131,13 +171,18 @@ async fn replication(test_duration: Duration) -> Result<()> {
                     }
                 }
 
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                // random delay
+                let read_latency = Duration::from_millis(
+                    rand::thread_rng()
+                        .gen_range(0..=max_replication_latency.as_millis().try_into().unwrap()),
+                );
+                tokio::time::sleep(read_latency).await;
             }
         }
     });
 
-    let total_inserted = write_loop.await??;
     let total_seen_by_replica = replication_loop.await??;
+    let total_inserted = write_loop.await??;
 
     println!("TOTAL inserted: {}", total_inserted);
     println!("TOTAL seen by replica: {}", total_seen_by_replica);

@@ -4,7 +4,7 @@ mod log;
 mod snapshot;
 mod wal;
 
-use std::{cmp::Reverse, collections::BinaryHeap};
+use std::{cmp::Reverse, collections::BinaryHeap, future::Future, sync::Arc};
 
 pub use ack::Ack;
 use ack::PendingAck;
@@ -36,7 +36,7 @@ pub async fn init(
 #[derive(Debug)]
 pub struct Primary {
     db: MylibsqlDB,
-    pending_acks: Mutex<BinaryHeap<Reverse<PendingAck>>>,
+    pending_acks: Arc<Mutex<BinaryHeap<Reverse<PendingAck>>>>,
 }
 
 impl Primary {
@@ -47,33 +47,35 @@ impl Primary {
         }
         Ok(Self {
             db,
-            pending_acks: Mutex::new(BinaryHeap::new()),
+            pending_acks: Arc::new(Mutex::new(BinaryHeap::new())),
         })
     }
 
-    pub async fn checkpoint<'a>(
-        &'a self,
-        save_log: impl FnOnce(Log) -> BoxFuture<'a, ()>,
-    ) -> Result<()> {
-        let checkpointed_frame_no = self.db.checkpoint(save_log).await?;
-        if let Some(checkpointed_frame_no) = checkpointed_frame_no {
-            let mut pending_acks = self.pending_acks.lock();
-            loop {
-                if let Some(Reverse(pending_ack)) = pending_acks.peek() {
-                    if pending_ack.is_ready(checkpointed_frame_no) {
-                        let Reverse(pending_ack) = pending_acks.pop().unwrap();
-                        if let Err(_e) = pending_ack.ack() {
-                            // TODO: log warning?
+    pub async fn checkpoint(
+        &self,
+        save_log: impl FnOnce(Log) -> BoxFuture<'static, ()> + Send + 'static,
+    ) -> Result<impl Future<Output = ()>> {
+        let pending_acks = self.pending_acks.clone();
+        let save_checkpoint = self.db.checkpoint(save_log).await?;
+        Ok(async move {
+            if let Ok(Some(checkpointed_frame_no)) = save_checkpoint.await {
+                let mut pending_acks = pending_acks.lock();
+                loop {
+                    if let Some(Reverse(pending_ack)) = pending_acks.peek() {
+                        if pending_ack.is_ready(checkpointed_frame_no) {
+                            let Reverse(pending_ack) = pending_acks.pop().unwrap();
+                            if let Err(_e) = pending_ack.ack() {
+                                // TODO: log warning?
+                            }
+                        } else {
+                            break;
                         }
                     } else {
                         break;
                     }
-                } else {
-                    break;
                 }
             }
-        }
-        Ok(())
+        })
     }
 
     pub async fn with_connection<A>(
@@ -93,7 +95,9 @@ impl Primary {
             self.pending_acks.lock().push(Reverse(pending_ack));
             Ok(ack)
         } else {
-            unreachable!()
+            Err(anyhow::anyhow!(
+                "invalid state, no frame number after write?"
+            ))
         }
     }
 
@@ -140,7 +144,7 @@ impl Replica {
     pub fn into_primary(self) -> Result<Primary> {
         Ok(Primary {
             db: self.db,
-            pending_acks: Mutex::new(BinaryHeap::new()),
+            pending_acks: Arc::new(Mutex::new(BinaryHeap::new())),
         })
     }
 }
