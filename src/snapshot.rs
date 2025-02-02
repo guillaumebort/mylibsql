@@ -33,4 +33,8 @@ impl Snapshot {
         tokio::fs::rename(self.path.as_ref(), path).await?;
         Ok(())
     }
+
+    pub async fn reopen(&self) -> Result<Self> {
+        Ok(Self::open(self.path.as_ref(), self.last_frame_no).await?)
+    }
 }

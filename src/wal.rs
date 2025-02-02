@@ -32,7 +32,7 @@ impl ShadowWal {
     pub async fn new(
         start_frame_no: u64,
     ) -> Result<(Self, WalWrapper<ShadowWal, Sqlite3WalManager>)> {
-        let log = Log::new(start_frame_no).await?;
+        let log = tokio::task::spawn_blocking(move || Log::new(start_frame_no)).await??;
         let log = Arc::new(Mutex::new(log));
         let buffer = Vec::new();
         let wal = ShadowWal { buffer, log };
@@ -42,6 +42,13 @@ impl ShadowWal {
 
     pub fn log(&self) -> MutexGuard<Log> {
         self.log.lock()
+    }
+
+    pub(crate) fn swap_log(&self) -> Result<Log> {
+        let mut log = self.log.lock();
+        let next_log = Log::new(log.next_frame_no())?;
+        let old_log = std::mem::replace(&mut *log, next_log);
+        Ok(old_log)
     }
 
     pub fn into_log(self) -> Result<Log> {

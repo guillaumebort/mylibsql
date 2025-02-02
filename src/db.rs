@@ -27,7 +27,9 @@ pub struct MylibsqlDB {
 
 impl Debug for MylibsqlDB {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MylibsqlDB").field("path", &self.path).finish()
+        f.debug_struct("MylibsqlDB")
+            .field("path", &self.path)
+            .finish()
     }
 }
 
@@ -112,7 +114,8 @@ impl MylibsqlDB {
         for frame in additional_log.frames_iter()? {
             Self::inject_frame(&mut self.injector, frame?).await?;
         }
-        *self.shadow_wal.log() = Log::new(additional_log.next_frame_no()).await?;
+        *self.shadow_wal.log() =
+            tokio::task::spawn_blocking(move || Log::new(additional_log.next_frame_no())).await??;
         self.injector.flush().await?;
         Self::wal_checkpoint(&*self.rw_conn.lock())?;
         Ok(())
@@ -129,6 +132,7 @@ impl MylibsqlDB {
     }
 
     fn wal_checkpoint(conn: &rusqlite::Connection) -> Result<()> {
+        // TODO: TRUNCATE here is likely going to fail in some cases, we need to revisit this
         conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", (), |row| {
             let status: i32 = row.get(0)?;
             let wal_frames: i32 = row.get(1)?;
@@ -146,36 +150,32 @@ impl MylibsqlDB {
 
     pub async fn with_rw_connection<A>(
         &self,
-        f: impl FnOnce(&rusqlite::Connection) -> Result<A, libsql_sys::rusqlite::Error> + Send + 'static,
+        f: impl FnOnce(&mut rusqlite::Connection) -> Result<A> + Send + 'static,
     ) -> Result<A>
     where
         A: Send + 'static,
     {
         let conn = self.rw_conn.clone();
-        Ok(tokio::task::spawn_blocking(move || f(&*conn.lock())).await??)
+        Ok(tokio::task::spawn_blocking(move || f(&mut *conn.lock())).await??)
     }
 
     pub async fn with_ro_connection<A>(
         &self,
-        f: impl FnOnce(&rusqlite::Connection) -> Result<A, libsql_sys::rusqlite::Error> + Send + 'static,
+        f: impl FnOnce(&mut rusqlite::Connection) -> Result<A> + Send + 'static,
     ) -> Result<A>
     where
         A: Send + 'static,
     {
         let conn = self.ro_conn.clone();
-        Ok(tokio::task::spawn_blocking(move || f(&*conn.lock())).await??)
+        Ok(tokio::task::spawn_blocking(move || f(&mut *conn.lock())).await??)
     }
 
-    pub async fn checkpoint(
-        &self,
-        f: impl FnOnce(Log) -> BoxFuture<'static, ()>,
+    pub async fn checkpoint<'a>(
+        &'a self,
+        f: impl FnOnce(Log) -> BoxFuture<'a, ()>,
     ) -> Result<Option<FrameNo>> {
-        let old_log = {
-            let mut log = self.shadow_wal.log();
-            Self::wal_checkpoint(&self.rw_conn.lock())?;
-            let next_log = Log::new(log.next_frame_no()).await?;
-            std::mem::replace(&mut *log, next_log)
-        };
+        let old_log = self.shadow_wal.swap_log()?; // TODO: swap_log is blocking
+        Self::wal_checkpoint(&*self.rw_conn.lock())?; // TODO: this is blocking as well
         let last_frame_no = old_log.last_commited_frame_no();
         f(old_log).await;
         Ok(last_frame_no)
@@ -249,13 +249,13 @@ mod tests {
         let db = MylibsqlDB::open(snapshot).await?;
         let count: usize = db
             .with_rw_connection(|conn| {
-                conn.query_row("select count(*) from lol", (), |row| row.get(0))
+                Ok(conn.query_row("select count(*) from lol", (), |row| row.get(0))?)
             })
             .await?;
         assert_eq!(count, 1);
         let count: usize = db
             .with_ro_connection(|conn| {
-                conn.query_row("select count(*) from lol", (), |row| row.get(0))
+                Ok(conn.query_row("select count(*) from lol", (), |row| row.get(0))?)
             })
             .await?;
         assert_eq!(count, 1);
@@ -265,13 +265,13 @@ mod tests {
         db.inject_log(log).await?;
         let count: usize = db
             .with_rw_connection(|conn| {
-                conn.query_row("select count(*) from lol", (), |row| row.get(0))
+                Ok(conn.query_row("select count(*) from lol", (), |row| row.get(0))?)
             })
             .await?;
         assert_eq!(count, 1);
         let count: usize = db
             .with_ro_connection(|conn| {
-                conn.query_row("select count(*) from lol", (), |row| row.get(0))
+                Ok(conn.query_row("select count(*) from lol", (), |row| row.get(0))?)
             })
             .await?;
         assert_eq!(count, 1);
@@ -283,7 +283,7 @@ mod tests {
     async fn with_ro_connection() -> Result<()> {
         let db = MylibsqlDB::open(blank_db()?).await?;
         assert!(db
-            .with_ro_connection(|conn| conn.execute("create table lol(x integer)", ()))
+            .with_ro_connection(|conn| Ok(conn.execute("create table lol(x integer)", ())?))
             .await
             .is_err());
         Ok(())
@@ -307,22 +307,22 @@ mod tests {
         assert_eq!(None, db.checkpoint(&save_log).await?);
 
         // first checkpoint (create table)
-        db.with_rw_connection(|conn| conn.execute("create table boo(x string)", ()))
+        db.with_rw_connection(|conn| Ok(conn.execute("create table boo(x string)", ())?))
             .await?;
         assert_eq!(Some(1), db.checkpoint(&save_log).await?);
 
         // second checkpoint (insert data)
-        db.with_rw_connection(|conn| conn.execute("insert into boo values ('YO')", ()))
+        db.with_rw_connection(|conn| Ok(conn.execute("insert into boo values ('YO')", ())?))
             .await?;
         assert_eq!(Some(2), db.checkpoint(&save_log).await?);
 
         // third checkpoint (update data)
-        db.with_rw_connection(|conn| conn.execute("update boo set x = 'YOO'", ()))
+        db.with_rw_connection(|conn| Ok(conn.execute("update boo set x = 'YOO'", ())?))
             .await?;
         assert_eq!(Some(3), db.checkpoint(&save_log).await?);
 
         // fourth checkpoint (delete data)
-        db.with_rw_connection(|conn| conn.execute("delete from boo", ()))
+        db.with_rw_connection(|conn| Ok(conn.execute("delete from boo", ())?))
             .await?;
         assert_eq!(Some(4), db.checkpoint(&save_log).await?);
 
@@ -338,13 +338,13 @@ mod tests {
         db.inject_log(logs_store.pop_front().unwrap()).await?;
         let count: usize = db
             .with_rw_connection(|conn| {
-                conn.query_row("select count(*) from boo", (), |row| row.get(0))
+                Ok(conn.query_row("select count(*) from boo", (), |row| row.get(0))?)
             })
             .await?;
         assert_eq!(count, 0);
         let count: usize = db
             .with_ro_connection(|conn| {
-                conn.query_row("select count(*) from boo", (), |row| row.get(0))
+                Ok(conn.query_row("select count(*) from boo", (), |row| row.get(0))?)
             })
             .await?;
         assert_eq!(count, 0);
@@ -352,22 +352,30 @@ mod tests {
         // apply second checkpoint
         db.inject_log(logs_store.pop_front().unwrap()).await?;
         let yo: String = db
-            .with_rw_connection(|conn| conn.query_row("select x from boo", (), |row| row.get(0)))
+            .with_rw_connection(|conn| {
+                Ok(conn.query_row("select x from boo", (), |row| row.get(0))?)
+            })
             .await?;
         assert_eq!(yo, "YO");
         let yo: String = db
-            .with_ro_connection(|conn| conn.query_row("select x from boo", (), |row| row.get(0)))
+            .with_ro_connection(|conn| {
+                Ok(conn.query_row("select x from boo", (), |row| row.get(0))?)
+            })
             .await?;
         assert_eq!(yo, "YO");
 
         // apply third checkpoint
         db.inject_log(logs_store.pop_front().unwrap()).await?;
         let yo: String = db
-            .with_rw_connection(|conn| conn.query_row("select x from boo", (), |row| row.get(0)))
+            .with_rw_connection(|conn| {
+                Ok(conn.query_row("select x from boo", (), |row| row.get(0))?)
+            })
             .await?;
         assert_eq!(yo, "YOO");
         let yo: String = db
-            .with_ro_connection(|conn| conn.query_row("select x from boo", (), |row| row.get(0)))
+            .with_ro_connection(|conn| {
+                Ok(conn.query_row("select x from boo", (), |row| row.get(0))?)
+            })
             .await?;
         assert_eq!(yo, "YOO");
 
@@ -375,23 +383,23 @@ mod tests {
         db.inject_log(logs_store.pop_front().unwrap()).await?;
         let count: usize = db
             .with_rw_connection(|conn| {
-                conn.query_row("select count(*) from boo", (), |row| row.get(0))
+                Ok(conn.query_row("select count(*) from boo", (), |row| row.get(0))?)
             })
             .await?;
         assert_eq!(count, 0);
         let count: usize = db
             .with_ro_connection(|conn| {
-                conn.query_row("select count(*) from boo", (), |row| row.get(0))
+                Ok(conn.query_row("select count(*) from boo", (), |row| row.get(0))?)
             })
             .await?;
         assert_eq!(count, 0);
 
         // now we can add additional data
-        db.with_rw_connection(|conn| conn.execute("insert into boo values ('LOL')", ()))
+        db.with_rw_connection(|conn| Ok(conn.execute("insert into boo values ('LOL')", ())?))
             .await?;
         let count: usize = db
             .with_ro_connection(|conn| {
-                conn.query_row("select count(*) from boo", (), |row| row.get(0))
+                Ok(conn.query_row("select count(*) from boo", (), |row| row.get(0))?)
             })
             .await?;
         assert_eq!(count, 1);

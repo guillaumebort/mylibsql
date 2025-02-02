@@ -3,7 +3,7 @@ use futures::FutureExt;
 use mylibsql::{self, Ack, Log, Primary, Snapshot};
 
 #[tokio::test]
-async fn reopen_as_primary_and_use_it() -> Result<()> {
+async fn basic_usage_with_acme_data() -> Result<()> {
     let primary = Primary::open(
         Snapshot::open("tests/data/acme/0.db", Some(2)).await?,
         vec![
@@ -17,17 +17,17 @@ async fn reopen_as_primary_and_use_it() -> Result<()> {
     // sanity check
     let x: Ack<usize> = primary
         .with_connection(|conn| {
-            conn.query_row("select count(*) from company", (), |row| row.get(0))
+            Ok(conn.query_row("select count(*) from company", (), |row| row.get(0))?)
         })
         .await?;
     assert_eq!(x.now_or_never(), Some(2));
     let x: Ack<String> = primary
         .with_connection(|conn| {
-            conn.query_row(
+            Ok(conn.query_row(
                 "select name from company order by salary desc ",
                 (),
                 |row| row.get(0),
-            )
+            )?)
         })
         .await?;
     assert_eq!(x.now_or_never(), Some("David".to_string()));
@@ -35,10 +35,10 @@ async fn reopen_as_primary_and_use_it() -> Result<()> {
     // primary looks ready, we can use it
     let mut ack = primary
         .with_connection(|conn| {
-            conn.execute(
+            Ok(conn.execute(
                 "insert into company values (7, 'Bob', 36, 'bam', 95700.00 )",
                 (),
-            )
+            )?)
         })
         .await?;
 
@@ -48,11 +48,11 @@ async fn reopen_as_primary_and_use_it() -> Result<()> {
     // but we can read our own writes
     let x: Ack<String> = primary
         .with_connection(|conn| {
-            conn.query_row(
+            Ok(conn.query_row(
                 "select name from company order by salary desc ",
                 (),
                 |row| row.get(0),
-            )
+            )?)
         })
         .await?;
     assert_eq!(x.now_or_never(), Some("Bob".to_string()));
@@ -82,7 +82,7 @@ async fn reopen_as_primary_and_use_it() -> Result<()> {
 
     // delete a row
     let mut ack = primary
-        .with_connection(|conn| conn.execute("delete from company where name = 'David'", ()))
+        .with_connection(|conn| Ok(conn.execute("delete from company where name = 'David'", ())?))
         .await?;
 
     // ack is pending
@@ -148,7 +148,7 @@ async fn generate_acme_test_data() -> Result<()> {
     for epoch in 1..=3 {
         let sql = std::fs::read_to_string(format!("tests/data/acme/{epoch}.sql"))?;
         let _ = primary
-            .with_connection(move |conn| conn.execute_batch(&sql))
+            .with_connection(move |conn| Ok(conn.execute_batch(&sql)?))
             .await?;
         primary
             .checkpoint(|log| {

@@ -87,44 +87,38 @@ impl Log {
         .await?
     }
 
-    pub async fn new(start_frame_no: u64) -> Result<Self> {
-        tokio::task::spawn_blocking(move || {
-            let file = tempfile()?;
-
-            let header = LogHeader {
-                version: 2.into(),
-                start_frame_no: start_frame_no.into(),
-                magic: MAGIC.into(),
-                page_size: (LIBSQL_PAGE_SIZE as i32).into(),
-                start_checksum: 0.into(),
-                frame_count: 0.into(),
-                mylibsql_version: Version::current().0.map(Into::into),
-            };
-
-            let mut this = Self {
-                file,
-                header,
-                uncommitted_frame_count: 0,
-                uncommitted_checksum: 0,
-                commited_checksum: 0,
-            };
-
-            this.write_header()?;
-
-            Ok(this)
-        })
-        .await?
-    }
-
-    pub fn into_file(self) -> File {
-        self.file
-    }
 
     pub async fn move_to(self, path: impl AsRef<Path>) -> Result<()> {
         let mut file = tokio::fs::File::from_std(self.file);
         let mut new_file = tokio::fs::File::create(path).await?;
         tokio::io::copy(&mut file, &mut new_file).await?;
         Ok(())
+    }
+
+    pub(crate) fn new(start_frame_no: u64) -> Result<Self> {
+        let file = tempfile()?;
+
+        let header = LogHeader {
+            version: 2.into(),
+            start_frame_no: start_frame_no.into(),
+            magic: MAGIC.into(),
+            page_size: (LIBSQL_PAGE_SIZE as i32).into(),
+            start_checksum: 0.into(),
+            frame_count: 0.into(),
+            mylibsql_version: Version::current().0.map(Into::into),
+        };
+
+        let mut this = Self {
+            file,
+            header,
+            uncommitted_frame_count: 0,
+            uncommitted_checksum: 0,
+            commited_checksum: 0,
+        };
+
+        this.write_header()?;
+
+        Ok(this)
     }
 
     fn read_header(file: &File) -> Result<LogHeader> {
@@ -289,7 +283,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_log_new() -> Result<()> {
-        let log = Log::new(0).await?;
+        let log = Log::new(0)?;
         assert_eq!(log.header.magic.get(), MAGIC);
         assert_eq!(log.header.version.get(), 2);
         assert_eq!(log.header.page_size.get(), LIBSQL_PAGE_SIZE as i32);
@@ -298,7 +292,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_log_commit_and_rollback() -> Result<()> {
-        let mut log = Log::new(0).await?;
+        let mut log = Log::new(0)?;
         let page = WalPage {
             page_no: 1,
             data: Bytes::from(vec![0; LIBSQL_PAGE_SIZE as usize]),
@@ -321,7 +315,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_log_move_to() -> Result<()> {
-        let log = Log::new(0).await?;
+        let log = Log::new(0)?;
         let new_path = NamedTempFile::new()?;
         log.move_to(&new_path).await?;
         assert!(new_path.path().exists());
@@ -330,7 +324,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_log_is_empty() -> Result<()> {
-        let mut log = Log::new(0).await?;
+        let mut log = Log::new(0)?;
         assert!(log.is_empty());
 
         let page = WalPage {
@@ -346,7 +340,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_log_frames_iter() -> Result<()> {
-        let mut log = Log::new(0).await?;
+        let mut log = Log::new(0)?;
         let page = WalPage {
             page_no: 1,
             data: Bytes::from(vec![0; LIBSQL_PAGE_SIZE as usize]),
@@ -359,6 +353,28 @@ mod tests {
         let frames: Vec<_> = log.frames_iter()?.collect::<Result<_>>()?;
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].header().page_no.get(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn zero_copy_header() -> Result<()> {
+        let expected =
+            base64::decode(r#"TVlMSUJTUUyFGgAAAAAAADkwAAAAAAAAKywKAAAAAAACAAAAABAAAAAAAAABAAAA"#)?;
+
+        assert_eq!(
+            LogHeader {
+                version: 2.into(),
+                start_frame_no: 12345.into(),
+                magic: MAGIC.into(),
+                page_size: (LIBSQL_PAGE_SIZE as i32).into(),
+                start_checksum: 6789.into(),
+                frame_count: 666667.into(),
+                mylibsql_version: Version([0, 0, 1, 0]).0.map(Into::into),
+            }
+            .as_bytes(),
+            &expected
+        );
+
         Ok(())
     }
 

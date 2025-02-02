@@ -51,9 +51,9 @@ impl Primary {
         })
     }
 
-    pub async fn checkpoint(
-        &self,
-        save_log: impl FnOnce(Log) -> BoxFuture<'static, ()>,
+    pub async fn checkpoint<'a>(
+        &'a self,
+        save_log: impl FnOnce(Log) -> BoxFuture<'a, ()>,
     ) -> Result<()> {
         let checkpointed_frame_no = self.db.checkpoint(save_log).await?;
         if let Some(checkpointed_frame_no) = checkpointed_frame_no {
@@ -78,7 +78,7 @@ impl Primary {
 
     pub async fn with_connection<A>(
         &self,
-        f: impl FnOnce(&rusqlite::Connection) -> Result<A, libsql_sys::rusqlite::Error> + Send + 'static,
+        f: impl FnOnce(&mut rusqlite::Connection) -> Result<A> + Send + 'static,
     ) -> Result<Ack<A>>
     where
         A: Send + Unpin + 'static,
@@ -125,7 +125,7 @@ impl Replica {
 
     pub async fn with_connection<A>(
         &self,
-        f: impl FnOnce(&rusqlite::Connection) -> Result<A, libsql_sys::rusqlite::Error> + Send + 'static,
+        f: impl FnOnce(&mut rusqlite::Connection) -> Result<A> + Send + 'static,
     ) -> Result<A>
     where
         A: Send + 'static,
