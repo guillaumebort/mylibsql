@@ -4,17 +4,19 @@ mod log;
 mod snapshot;
 mod wal;
 
-use std::{cmp::Reverse, collections::BinaryHeap, future::Future, sync::Arc};
+use std::{cmp::Reverse, collections::BinaryHeap, future::Future, ops::Range, sync::Arc};
 
 pub use ack::Ack;
 use ack::PendingAck;
 use anyhow::Result;
 use db::MylibsqlDB;
 use futures::future::BoxFuture;
+use libsql::replication::{Frame, FrameNo};
 pub use libsql_sys::rusqlite;
 pub use log::Log;
 use parking_lot::Mutex;
 pub use snapshot::Snapshot;
+use tokio::sync::{mpsc, Semaphore};
 
 struct Version([u16; 4]);
 
@@ -28,15 +30,67 @@ impl Version {
 }
 
 pub async fn init(
-    init: impl FnOnce(&rusqlite::Connection) -> Result<()> + Send + 'static,
+    init: impl FnOnce(&rusqlite::Connection) -> Result<()> + Send + Sync + 'static,
 ) -> Result<(Snapshot, Log)> {
     MylibsqlDB::init(init).await
+}
+
+pub struct Frames {
+    rx: mpsc::UnboundedReceiver<(Log, Range<FrameNo>)>,
+    pending_acks: Arc<Mutex<BinaryHeap<Reverse<PendingAck>>>>,
+}
+
+impl Frames {
+    pub async fn next(&mut self) -> Result<Option<Vec<Frame>>> {
+        if let Some((log, frames_no)) = self.rx.recv().await {
+            let mut frames = Vec::with_capacity(frames_no.size_hint().0);
+            for frame_no in frames_no {
+                frames.push(log.read_frame(frame_no).await?);
+            }
+            Ok(Some(frames))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub async fn try_next(&mut self) -> Result<Vec<Frame>> {
+        let (log, frames_no) = self.rx.try_recv()?;
+        let mut frames = Vec::with_capacity(frames_no.size_hint().0);
+        for frame_no in frames_no {
+            frames.push(log.read_frame(frame_no).await?);
+        }
+        Ok(frames)
+    }
+
+    pub fn ack_replicated(&self, last_replicated_frame_no: FrameNo) {
+        let mut pending_acks = self.pending_acks.lock();
+        ack_pending(&mut pending_acks, last_replicated_frame_no);
+    }
+}
+
+fn ack_pending(pending_acks: &mut BinaryHeap<Reverse<PendingAck>>, safe_frame_no: FrameNo) {
+    loop {
+        if let Some(Reverse(pending_ack)) = pending_acks.peek() {
+            if pending_ack.is_ready(safe_frame_no) {
+                let Reverse(pending_ack) = pending_acks.pop().unwrap();
+                if let Err(_e) = pending_ack.ack() {
+                    // TODO: log warning?
+                }
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
 }
 
 #[derive(Debug)]
 pub struct Primary {
     db: MylibsqlDB,
     pending_acks: Arc<Mutex<BinaryHeap<Reverse<PendingAck>>>>,
+    frames_tx: Option<mpsc::UnboundedSender<(Log, Range<FrameNo>)>>,
+    checkpoint_semaphore: Arc<Semaphore>,
 }
 
 impl Primary {
@@ -48,33 +102,35 @@ impl Primary {
         Ok(Self {
             db,
             pending_acks: Arc::new(Mutex::new(BinaryHeap::new())),
+            frames_tx: None,
+            checkpoint_semaphore: Arc::new(Semaphore::new(1)),
         })
+    }
+
+    pub fn capture_frames(&mut self) -> Frames {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.frames_tx = Some(tx);
+        Frames {
+            rx,
+            pending_acks: self.pending_acks.clone(),
+        }
     }
 
     pub async fn checkpoint(
         &self,
         save_log: impl FnOnce(Log) -> BoxFuture<'static, ()> + Send + 'static,
-    ) -> Result<impl Future<Output = ()>> {
+    ) -> Result<impl Future<Output = Option<FrameNo>>> {
         let pending_acks = self.pending_acks.clone();
         let save_checkpoint = self.db.checkpoint(save_log).await?;
+        let checkpoint_permit = self.checkpoint_semaphore.clone().acquire_owned().await;
         Ok(async move {
-            if let Ok(Some(checkpointed_frame_no)) = save_checkpoint.await {
+            let result = save_checkpoint.await;
+            if let Some(checkpointed_frame_no) = &result {
                 let mut pending_acks = pending_acks.lock();
-                loop {
-                    if let Some(Reverse(pending_ack)) = pending_acks.peek() {
-                        if pending_ack.is_ready(checkpointed_frame_no) {
-                            let Reverse(pending_ack) = pending_acks.pop().unwrap();
-                            if let Err(_e) = pending_ack.ack() {
-                                // TODO: log warning?
-                            }
-                        } else {
-                            break;
-                        }
-                    } else {
-                        break;
-                    }
-                }
+                ack_pending(&mut pending_acks, *checkpointed_frame_no);
             }
+            drop(checkpoint_permit);
+            result
         })
     }
 
@@ -85,19 +141,16 @@ impl Primary {
     where
         A: Send + Unpin + 'static,
     {
-        let start_frame_no = self.db.current_frame_no()?;
-        let a = self.db.with_rw_connection(f).await?;
-        let end_frame_no = self.db.current_frame_no()?;
-        if start_frame_no == end_frame_no {
-            Ok(Ack::new_ready(a))
-        } else if let Some(end_frame_no) = end_frame_no {
-            let (ack, pending_ack) = Ack::new_pending(a, end_frame_no);
+        let (a, log, frames_no) = self.db.with_rw_connection(f).await?;
+        if let Some(last_frame_no) = frames_no.clone().last() {
+            let (ack, pending_ack) = Ack::new_pending(a, last_frame_no);
             self.pending_acks.lock().push(Reverse(pending_ack));
+            if let Some(frames_tx) = &self.frames_tx {
+                let _ = frames_tx.send((log, frames_no));
+            }
             Ok(ack)
         } else {
-            Err(anyhow::anyhow!(
-                "invalid state, no frame number after write?"
-            ))
+            Ok(Ack::new_ready(a))
         }
     }
 
@@ -145,6 +198,8 @@ impl Replica {
         Ok(Primary {
             db: self.db,
             pending_acks: Arc::new(Mutex::new(BinaryHeap::new())),
+            frames_tx: None,
+            checkpoint_semaphore: Arc::new(Semaphore::new(1)),
         })
     }
 }

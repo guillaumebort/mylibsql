@@ -1,6 +1,6 @@
 use super::log::Log;
 
-use std::sync::Arc;
+use std::sync::{atomic::AtomicBool, Arc};
 
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
@@ -26,16 +26,22 @@ pub struct WalPage {
 pub struct ShadowWal {
     buffer: Vec<WalPage>,
     log: Arc<Mutex<Log>>,
+    poisoned: Arc<AtomicBool>,
 }
 
 impl ShadowWal {
     pub async fn new(
         start_frame_no: u64,
     ) -> Result<(Self, WalWrapper<ShadowWal, Sqlite3WalManager>)> {
-        let log = tokio::task::spawn_blocking(move || Log::new(start_frame_no)).await??;
+        let log = tokio::task::spawn_blocking(move || Log::new_from(start_frame_no)).await??;
         let log = Arc::new(Mutex::new(log));
         let buffer = Vec::new();
-        let wal = ShadowWal { buffer, log };
+        let poisoned = Arc::new(AtomicBool::new(false));
+        let wal = ShadowWal {
+            buffer,
+            log,
+            poisoned,
+        };
         let wal_wrapper = WalWrapper::new(wal.clone(), Sqlite3WalManager::new());
         Ok((wal, wal_wrapper))
     }
@@ -44,17 +50,32 @@ impl ShadowWal {
         self.log.lock()
     }
 
-    pub(crate) fn swap_log(&self) -> Result<Log> {
+    pub fn swap_log(&self, with: impl FnOnce(&Log) -> Result<Log> + Send + 'static) -> Result<Log> {
         let mut log = self.log.lock();
-        let next_log = Log::new(log.next_frame_no())?;
+        let next_log = with(&*log)?;
         let old_log = std::mem::replace(&mut *log, next_log);
         Ok(old_log)
     }
 
     pub fn into_log(self) -> Result<Log> {
         Ok(Arc::into_inner(self.log)
-            .ok_or_else(|| anyhow!("log is still used by a shadow wal"))?
+            .ok_or_else(|| anyhow!("shadow wal is still used"))?
             .into_inner())
+    }
+
+    pub fn check_poisoned(&self) -> Result<()> {
+        if self.poisoned.load(std::sync::atomic::Ordering::Relaxed) {
+            Err(anyhow!(
+                "fatal error: WAL for this database has been poisoned because of a previous fatal error"
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn poison(&self) {
+        self.poisoned
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -98,7 +119,7 @@ impl<W: Wal> WrapWal<W> for ShadowWal {
                 tracing::error!(
                     "fatal error: log failed to commit: inconsistent replication log: {e}"
                 );
-                std::process::abort();
+                self.poison();
             }
         }
 

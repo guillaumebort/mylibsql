@@ -61,7 +61,7 @@ async fn basic_usage_with_acme_data() -> Result<()> {
     primary
         .checkpoint(|log| {
             async move {
-                assert_eq!(log.header().last_frame_no(), Some(19));
+                assert_eq!(log.last_frame_no(), Some(19));
             }
             .boxed()
         })
@@ -75,7 +75,7 @@ async fn basic_usage_with_acme_data() -> Result<()> {
     primary
         .checkpoint(|log| {
             async move {
-                assert_eq!(log.header().last_frame_no(), Some(19));
+                assert_eq!(log.last_frame_no(), Some(19));
             }
             .boxed()
         })
@@ -99,7 +99,7 @@ async fn basic_usage_with_acme_data() -> Result<()> {
     primary
         .checkpoint(|log| {
             async move {
-                assert_eq!(log.header().last_frame_no(), Some(21));
+                assert_eq!(log.last_frame_no(), Some(21));
             }
             .boxed()
         })
@@ -140,7 +140,7 @@ async fn generate_acme_test_data() -> Result<()> {
 
     dbg!(snapshot.last_frame_no);
     snapshot.move_to("tests/data/acme/0.db").await?;
-    log.move_to("tests/data/acme/0.log").await?;
+    log.copy_to("tests/data/acme/0.log").await?;
 
     let primary = mylibsql::Primary::open(
         Snapshot::open("tests/data/acme/0.db", Some(2)).await?,
@@ -156,7 +156,7 @@ async fn generate_acme_test_data() -> Result<()> {
         primary
             .checkpoint(move |log| {
                 async move {
-                    log.move_to(format!("tests/data/acme/{epoch}.log"))
+                    log.copy_to(format!("tests/data/acme/{epoch}.log"))
                         .await
                         .unwrap();
                 }

@@ -1,21 +1,21 @@
 use super::*;
-use std::{fmt::Debug, future::Future, path::PathBuf, sync::Arc};
+use std::{fmt::Debug, future::Future, ops::Range, path::PathBuf, sync::Arc};
 
 use anyhow::{anyhow, bail, Result};
 use futures::future::BoxFuture;
 use libsql::replication::{Frame, FrameNo};
 use libsql_replication::injector::{Injector, SqliteInjector};
 use libsql_sys::{
-    connection::NO_AUTOCHECKPOINT, rusqlite::OpenFlags, wal::{wrapper::WrappedWal, Sqlite3Wal, Sqlite3WalManager}, Connection
+    connection::NO_AUTOCHECKPOINT,
+    rusqlite::OpenFlags,
+    wal::{wrapper::WrappedWal, Sqlite3Wal, Sqlite3WalManager},
+    Connection,
 };
 use log::Log;
 use parking_lot::Mutex;
+use rusqlite::{DatabaseName, TransactionState};
 use snapshot::Snapshot;
 use tempfile::NamedTempFile;
-use tokio::{
-    sync::{mpsc, oneshot},
-    task::JoinSet,
-};
 use wal::ShadowWal;
 
 pub struct MylibsqlDB {
@@ -24,9 +24,6 @@ pub struct MylibsqlDB {
     injector: SqliteInjector,
     rw_conn: Arc<Mutex<Connection<WrappedWal<ShadowWal, Sqlite3Wal>>>>,
     ro_conn: Arc<Mutex<Connection<Sqlite3Wal>>>,
-    checkpoint_tx: mpsc::UnboundedSender<(BoxFuture<'static, ()>, oneshot::Sender<()>)>,
-    #[allow(unused)]
-    tasks: JoinSet<()>,
 }
 
 impl Debug for MylibsqlDB {
@@ -66,7 +63,7 @@ impl MylibsqlDB {
             Ok((
                 Snapshot {
                     path: Box::new(db),
-                    last_frame_no: log.header.last_frame_no(),
+                    last_frame_no: log.last_frame_no(),
                 },
                 log,
             ))
@@ -84,7 +81,6 @@ impl MylibsqlDB {
                 .unwrap_or_default(),
         )
         .await?;
-        let mut tasks = JoinSet::new();
         let db = tokio::task::spawn_blocking(move || {
             let rw_conn = Connection::open(
                 &path,
@@ -100,48 +96,37 @@ impl MylibsqlDB {
                 NO_AUTOCHECKPOINT,
                 None,
             )?;
-            let (checkpoint_tx, checkpoint_rx) = mpsc::unbounded_channel();
-            tasks.spawn(Self::save_checkpoints(checkpoint_rx));
             anyhow::Ok(MylibsqlDB {
                 path,
                 rw_conn: Arc::new(Mutex::new(rw_conn)),
                 ro_conn: Arc::new(Mutex::new(ro_conn)),
                 shadow_wal,
                 injector,
-                checkpoint_tx,
-                tasks,
             })
         })
         .await??;
         Ok(db)
     }
 
-    async fn save_checkpoints(
-        mut checkpoint_rx: mpsc::UnboundedReceiver<(BoxFuture<'static, ()>, oneshot::Sender<()>)>,
-    ) {
-        while let Some((checkpoint, ack)) = checkpoint_rx.recv().await {
-            checkpoint.await;
-            let _ = ack.send(());
-        }
-    }
-
     pub async fn inject_log(&mut self, additional_log: Log) -> Result<()> {
-        let additional_log_start_frame_no = additional_log.header().start_frame_no.get();
+        let additional_log_start_frame_no = additional_log.start_frame_no();
         {
             let log = self.shadow_wal.log();
             let expected_frame_no = log.next_frame_no();
-            if !log.is_empty() {
-                bail!("current log is not empty");
-            }
-            if additional_log_start_frame_no != expected_frame_no {
+            if !log.is_empty() || additional_log_start_frame_no != expected_frame_no {
                 bail!("log does not start at the expected frame number (expected {expected_frame_no}, got {additional_log_start_frame_no})");
             }
         }
-        for frame in additional_log.frames_iter()? {
+        for frame in additional_log.frames_iter() {
             Self::inject_frame(&mut self.injector, frame?).await?;
         }
-        *self.shadow_wal.log() =
-            tokio::task::spawn_blocking(move || Log::new(additional_log.next_frame_no())).await??;
+        self.injector.flush().await?;
+        let shadow_wal = self.shadow_wal.clone();
+        let next_frame_no = additional_log.next_frame_no();
+        tokio::task::spawn_blocking(move || {
+            shadow_wal.swap_log(move |_| Log::new_from(next_frame_no))
+        })
+        .await??;
         let rw_conn = self.rw_conn.clone();
         tokio::task::spawn_blocking(move || {
             // truncate WAL
@@ -157,7 +142,6 @@ impl MylibsqlDB {
                 })
         })
         .await??;
-        self.injector.flush().await?;
         Ok(())
     }
 
@@ -174,12 +158,42 @@ impl MylibsqlDB {
     pub async fn with_rw_connection<A>(
         &self,
         f: impl FnOnce(&mut rusqlite::Connection) -> Result<A> + Send + 'static,
-    ) -> Result<A>
+    ) -> Result<(A, Log, Range<FrameNo>)>
     where
         A: Send + 'static,
     {
         let conn = self.rw_conn.clone();
-        Ok(tokio::task::spawn_blocking(move || f(&mut *conn.lock())).await??)
+        let shadow_wal = self.shadow_wal.clone();
+        shadow_wal.check_poisoned()?;
+
+        Ok(tokio::task::spawn_blocking(move || {
+            let mut conn = conn.lock();
+
+            // record the start frame number
+            let start_frame_no = shadow_wal.log().next_frame_no();
+            let a = f(&mut conn)?;
+
+            // auto-rollback pending transaction
+            let result = if conn.transaction_state(None) != Ok(TransactionState::None) {
+                conn.execute_batch("ROLLBACK;")?;
+                Err(anyhow!("a transaction was still pending"))
+            } else {
+                // record the end frame number
+                let end_frame_no = shadow_wal.log().next_frame_no();
+                let frames = start_frame_no..end_frame_no;
+
+                Ok((a, shadow_wal.log().clone(), frames))
+            };
+
+            // sanity check
+            if shadow_wal.log().has_uncommitted_frames() {
+                shadow_wal.poison();
+                bail!("fatal error: uncommitted frames in the log");
+            }
+
+            result
+        })
+        .await??)
     }
 
     pub async fn with_ro_connection<A>(
@@ -189,50 +203,47 @@ impl MylibsqlDB {
     where
         A: Send + 'static,
     {
+        self.shadow_wal.check_poisoned()?;
         let conn = self.ro_conn.clone();
-        Ok(tokio::task::spawn_blocking(move || f(&mut *conn.lock())).await??)
+        Ok(tokio::task::spawn_blocking(move || {
+            let mut conn = conn.lock();
+            debug_assert!(conn.is_readonly(DatabaseName::Main)?);
+            f(&mut conn)
+        })
+        .await??)
     }
 
     pub async fn checkpoint(
         &self,
         f: impl FnOnce(Log) -> BoxFuture<'static, ()>,
-    ) -> Result<impl Future<Output = Result<Option<FrameNo>>>> {
+    ) -> Result<impl Future<Output = Option<FrameNo>>> {
         let shadow_wal = self.shadow_wal.clone();
+        shadow_wal.check_poisoned()?;
         let rw_conn = self.rw_conn.clone();
         let old_log = tokio::task::spawn_blocking(move || {
-            let old_log = shadow_wal.swap_log()?;
+            let rw_conn = rw_conn.lock();
+            let old_log = shadow_wal.swap_log(|log| Log::new_from(log.next_frame_no()))?;
             // checkpoint WAL as much as possible
-            rw_conn
-                .lock()
-                .query_row_and_then("PRAGMA wal_checkpoint(PASSIVE)", (), |row| {
-                    let status: i32 = row.get(0)?;
-                    if status != 0 {
-                        Err(anyhow!("WAL checkpoint failed with status {}", status))
-                    } else {
-                        Ok(())
-                    }
-                })?;
+            rw_conn.query_row_and_then("PRAGMA wal_checkpoint(PASSIVE)", (), |row| {
+                let status: i32 = row.get(0)?;
+                if status != 0 {
+                    shadow_wal.poison();
+                    Err(anyhow!(
+                        "fatal error: WAL checkpoint failed with status {}",
+                        status
+                    ))
+                } else {
+                    Ok(())
+                }
+            })?;
             anyhow::Ok(old_log)
         })
         .await??;
         let last_frame_no = old_log.last_commited_frame_no();
-        let (tx, rx) = oneshot::channel();
-        self.checkpoint_tx
-            .send((f(old_log), tx))
-            .map_err(|_| anyhow!("cannot process checkpoint"))?;
         Ok(async move {
-            rx.await?;
-            Ok(last_frame_no)
+            f(old_log).await;
+            last_frame_no
         })
-    }
-
-    pub fn current_frame_no(&self) -> Result<Option<FrameNo>> {
-        let log = self.shadow_wal.log();
-        if log.has_uncommitted_frames() {
-            Err(anyhow!("in the middle of a transaction"))
-        } else {
-            Ok(log.last_commited_frame_no())
-        }
     }
 }
 
@@ -296,7 +307,8 @@ mod tests {
             .with_rw_connection(|conn| {
                 Ok(conn.query_row("select count(*) from lol", (), |row| row.get(0))?)
             })
-            .await?;
+            .await?
+            .0;
         assert_eq!(count, 1);
         let count: usize = db
             .with_ro_connection(|conn| {
@@ -312,7 +324,8 @@ mod tests {
             .with_rw_connection(|conn| {
                 Ok(conn.query_row("select count(*) from lol", (), |row| row.get(0))?)
             })
-            .await?;
+            .await?
+            .0;
         assert_eq!(count, 1);
         let count: usize = db
             .with_ro_connection(|conn| {
@@ -349,27 +362,27 @@ mod tests {
         };
 
         let db = MylibsqlDB::open(blank_db()?).await?;
-        assert_eq!(None, db.checkpoint(&save_log).await?.await?);
+        assert_eq!(None, db.checkpoint(&save_log).await?.await);
 
         // first checkpoint (create table)
         db.with_rw_connection(|conn| Ok(conn.execute("create table boo(x string)", ())?))
             .await?;
-        assert_eq!(Some(1), db.checkpoint(&save_log).await?.await?);
+        assert_eq!(Some(1), db.checkpoint(&save_log).await?.await);
 
         // second checkpoint (insert data)
         db.with_rw_connection(|conn| Ok(conn.execute("insert into boo values ('YO')", ())?))
             .await?;
-        assert_eq!(Some(2), db.checkpoint(&save_log).await?.await?);
+        assert_eq!(Some(2), db.checkpoint(&save_log).await?.await);
 
         // third checkpoint (update data)
         db.with_rw_connection(|conn| Ok(conn.execute("update boo set x = 'YOO'", ())?))
             .await?;
-        assert_eq!(Some(3), db.checkpoint(&save_log).await?.await?);
+        assert_eq!(Some(3), db.checkpoint(&save_log).await?.await);
 
         // fourth checkpoint (delete data)
         db.with_rw_connection(|conn| Ok(conn.execute("delete from boo", ())?))
             .await?;
-        assert_eq!(Some(4), db.checkpoint(&save_log).await?.await?);
+        assert_eq!(Some(4), db.checkpoint(&save_log).await?.await);
 
         drop(save_log);
         let mut logs_store = Arc::into_inner(logs_store).unwrap().into_inner();
@@ -385,7 +398,8 @@ mod tests {
             .with_rw_connection(|conn| {
                 Ok(conn.query_row("select count(*) from boo", (), |row| row.get(0))?)
             })
-            .await?;
+            .await?
+            .0;
         assert_eq!(count, 0);
         let count: usize = db
             .with_ro_connection(|conn| {
@@ -400,7 +414,8 @@ mod tests {
             .with_rw_connection(|conn| {
                 Ok(conn.query_row("select x from boo", (), |row| row.get(0))?)
             })
-            .await?;
+            .await?
+            .0;
         assert_eq!(yo, "YO");
         let yo: String = db
             .with_ro_connection(|conn| {
@@ -415,7 +430,8 @@ mod tests {
             .with_rw_connection(|conn| {
                 Ok(conn.query_row("select x from boo", (), |row| row.get(0))?)
             })
-            .await?;
+            .await?
+            .0;
         assert_eq!(yo, "YOO");
         let yo: String = db
             .with_ro_connection(|conn| {
@@ -430,7 +446,8 @@ mod tests {
             .with_rw_connection(|conn| {
                 Ok(conn.query_row("select count(*) from boo", (), |row| row.get(0))?)
             })
-            .await?;
+            .await?
+            .0;
         assert_eq!(count, 0);
         let count: usize = db
             .with_ro_connection(|conn| {
@@ -457,7 +474,51 @@ mod tests {
             .boxed()
         })
         .await?
+        .await;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bad_transaction() -> Result<()> {
+        let (snapshot, log) = MylibsqlDB::init(|conn| {
+            conn.execute("create table lol(x integer)", ())?;
+            Ok(())
+        })
         .await?;
+        assert_eq!(2, log.next_frame_no());
+
+        let db = MylibsqlDB::open(snapshot).await?;
+
+        // this is not valid to keep a transaction pending like this
+        assert!(db
+            .with_rw_connection(|conn| {
+                conn.execute_batch("begin;")?;
+                conn.execute_batch("insert into lol values (1)")?;
+                Ok(())
+            })
+            .await
+            .is_err());
+
+        // here it is ok because txn will be auto-rollback during the drop
+        assert!(db
+            .with_rw_connection(|conn| {
+                let txn = conn.transaction()?;
+                txn.execute_batch("insert into lol values (1)")?;
+                Ok(())
+            })
+            .await
+            .is_ok());
+
+        let (_, _, frames) = db
+            .with_rw_connection(|conn| {
+                let txn = conn.transaction()?;
+                txn.execute_batch("insert into lol values (1)")?;
+                txn.commit()?;
+                Ok(())
+            })
+            .await?;
+        assert_eq!(frames, 2..3); // we should have a single frame
 
         Ok(())
     }
