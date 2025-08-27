@@ -1,6 +1,6 @@
 [package]
 name = "mylibsql"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 authors = ["Guillaume Bort <guillaume.bort@gmail.com>"]
 description = "A personal take on libsql, enabling SQLite replication with application-controlled checkpointing—no dedicated server required"
@@ -10,9 +10,9 @@ repository = "https://github.com/guillaumebort/mylibsql"
 documentation = "https://docs.rs/mylibsql/latest/mylibsql/"
 
 [dependencies]
-libsql = "0.6.0"
-libsql-sys = "0.8.0"
-libsql_replication = "0.6.0"
+libsql = "0.9.21"
+libsql-sys = "0.9.21"
+libsql_replication = "0.9.21"
 anyhow = "1"
 tracing = "0.1"
 bytes = "1"
